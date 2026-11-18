@@ -1,0 +1,29 @@
+name: Bump Homebrew Tap
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '!v*-*'
+
+permissions: {}
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    runs-on: ${{ fromJson(vars.RUNNER_LINUX) }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --generate-notes
+
+  bump:
+    needs: release
+    uses: happitec-inc/public-actions/.github/workflows/bump-tap-formula.yml@main
+    secrets: inherit
+    with:
+      runner: ${{ vars.RUNNER_LINUX }}
+      formula: md2keyx
