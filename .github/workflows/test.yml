@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ${{ fromJson(vars.RUNNER_LINUX) }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v5

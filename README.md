@@ -10,11 +10,13 @@ Compile plain Markdown decks into validated Apple [Keynote Interchange Format](h
 
 ### Homebrew (macOS)
 
+Once `Formula/md2keyx.rb` is registered on `happitec-inc/homebrew-tap` and `v0.1.0` is tagged:
+
 ```bash
 brew install happitec-inc/tap/md2keyx
 ```
 
-### Python / uv
+### Python / uv (Available Now)
 
 ```bash
 uv pip install git+https://github.com/happitec-inc/md2keyx.git

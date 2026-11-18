@@ -12,18 +12,18 @@ jobs:
   release:
     permissions:
       contents: write
-    runs-on: ${{ fromJson(vars.RUNNER_LINUX) }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Create GitHub Release
+      - name: Create GitHub Release if absent
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" --generate-notes
+        run: gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 || gh release create "${GITHUB_REF_NAME}" --generate-notes
 
   bump:
     needs: release
     uses: happitec-inc/public-actions/.github/workflows/bump-tap-formula.yml@main
     secrets: inherit
     with:
-      runner: ${{ vars.RUNNER_LINUX }}
+      runner: '["ubuntu-latest"]'
       formula: md2keyx

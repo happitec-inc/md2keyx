@@ -243,8 +243,14 @@ def _extract_notes_and_directives(
                 if note_text:
                     notes.append(note_text)
             else:
+                yaml_candidate = re.sub(
+                    r"(:\s*)(#[0-9A-Fa-f]{3,6})(?=\s*$)",
+                    r'\1"\2"',
+                    inner_stripped,
+                    flags=re.MULTILINE,
+                )
                 try:
-                    parsed = yaml.safe_load(inner_stripped)
+                    parsed = yaml.safe_load(yaml_candidate)
                 except yaml.YAMLError:
                     parsed = None
                 if isinstance(parsed, dict) and any(k in _DIRECTIVE_KEYS for k in parsed):

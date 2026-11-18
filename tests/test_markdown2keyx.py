@@ -94,6 +94,21 @@ Line two
     assert deck.slides[1].note == "Line one\nLine two"
 
 
+def test_multiline_hex_background_directive() -> None:
+    md = """# Slide 1
+
+---
+<!--
+background: #112233
+depth: 2
+-->
+# Slide 2
+"""
+    deck = parse_markdown(md)
+    assert deck.slides[1].background == "#112233"
+    assert deck.slides[1].depth == 2
+
+
 def test_blocks_parsing() -> None:
     md = """# Title
 
@@ -199,6 +214,12 @@ Visit [Example](https://example.com), jump to [Section One](#sec-1), or [broken]
     assert [s.depth for s in reopened.presentation.slides] == [1, 1, 2]
     assert reopened.presentation.slides[2].note.string == "Speak clearly."
     assert "sample.png" in reopened.resources
+    bg_override = reopened.presentation.slides[2].background
+    assert bg_override.is_value
+    bg_rgba = bg_override.get().standard.color.rgba
+    assert bg_rgba.red == pytest.approx(0xF5 / 255.0)
+    assert bg_rgba.green == pytest.approx(0xF7 / 255.0)
+    assert bg_rgba.blue == pytest.approx(0xFA / 255.0)
 
 
 def test_compile_demo_deck(tmp_path: Path) -> None:
@@ -233,11 +254,35 @@ hierarchy: section
 - First bullet
   - Sub bullet
 - Second bullet
+
+---
+<!-- layout: Title & Bullets -->
+# Data Summary
+
+| Metric | Value |
+| --- | --- |
+| Slides | 3 |
 """
     deck = parse_markdown(md)
     out = tmp_path / "tidal_out.keyx"
     result = compile_deck(deck, out, base_dir=tmp_path, template_override=tidal)
-    assert result.slide_count == 2
+    assert result.slide_count == 3
+
+    with zipfile.ZipFile(out, "r") as zf:
+        main = json.loads(zf.read("main.json"))
+    assert _find_nulls(main) == []
+
     reopened = KeyxDocument.open(out)
-    assert len(reopened.presentation.slides) == 2
+    assert len(reopened.presentation.slides) == 3
     assert reopened.presentation.slides[1].layout == "Title & Bullets"
+    body_placeholder = next(
+        obj
+        for obj in reopened.presentation.slides[2].contents
+        if obj.placeholder_info
+        and obj.placeholder_info.defined
+        and obj.placeholder_info.defined.kind.value == "body"
+    )
+    body_obj = body_placeholder.object.textbox or body_placeholder.object.shape
+    assert body_obj is not None
+    assert body_obj.text is None or all(p.contents is None for p in (body_obj.text.paragraphs or []))
+    assert any(obj.object.table is not None for obj in reopened.presentation.slides[2].contents)

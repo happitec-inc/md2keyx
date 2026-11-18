@@ -989,22 +989,30 @@ def _compile_template_slide(
             slide, placeholders["TITLE"], _spans_plain_text(title_block.spans)
         )
 
-    if remaining_blocks and "BODY" in placeholders:
-        first = remaining_blocks[0]
-        if isinstance(first, ListBlock):
-            remaining_blocks.pop(0)
-            lines = [_spans_plain_text(item.spans) for item in first.items]
-            levels = [item.level for item in first.items]
+    if "SUBTITLE" in placeholders:
+        if remaining_blocks and isinstance(remaining_blocks[0], (HeadingBlock, ParagraphBlock)):
+            sub_block = remaining_blocks.pop(0)
+            set_slide_placeholder_text(
+                slide, placeholders["SUBTITLE"], _spans_plain_text(sub_block.spans)
+            )
+        else:
+            set_slide_placeholder_text(slide, placeholders["SUBTITLE"], None)
+
+    if "BODY" in placeholders:
+        if remaining_blocks and isinstance(remaining_blocks[0], ListBlock):
+            first_list = remaining_blocks.pop(0)
+            lines = [_spans_plain_text(item.spans) for item in first_list.items]
+            levels = [item.level for item in first_list.items]
             set_slide_placeholder_text(
                 slide, placeholders["BODY"], lines, list_levels=levels
             )
-        elif isinstance(first, (ParagraphBlock, HeadingBlock)):
-            remaining_blocks.pop(0)
+        elif remaining_blocks and isinstance(remaining_blocks[0], (ParagraphBlock, HeadingBlock)):
+            first_text = remaining_blocks.pop(0)
             set_slide_placeholder_text(
-                slide, placeholders["BODY"], _spans_plain_text(first.spans)
+                slide, placeholders["BODY"], _spans_plain_text(first_text.spans)
             )
-    elif "BODY" in placeholders:
-        set_slide_placeholder_text(slide, placeholders["BODY"], None)
+        else:
+            set_slide_placeholder_text(slide, placeholders["BODY"], None)
 
     if slide.contents is None:
         slide.contents = []
