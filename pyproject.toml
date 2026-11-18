@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "md2keyx"
+version = "0.1.0"
+description = "Compile Markdown decks into schema-validated Apple Keynote Interchange Format (.keyx) presentations."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+dependencies = [
+  "creator-studio-doc-format>=0.1.0",
+  "markdown-it-py>=4.0",
+  "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/happitec-inc/md2keyx"
+Repository = "https://github.com/happitec-inc/md2keyx"
+Issues = "https://github.com/happitec-inc/md2keyx/issues"
+
+[project.scripts]
+md2keyx = "markdown2keyx.cli:main"
+markdown2keyx = "markdown2keyx.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
