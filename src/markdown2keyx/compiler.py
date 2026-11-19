@@ -15,6 +15,7 @@ from creator_studio_doc_format.authoring import (
 from creator_studio_doc_format.core import (
     RGBA,
     AlignmentType,
+    BezierPath,
     BodyStrokeProperties,
     CanvasObject,
     Cell,
@@ -34,7 +35,6 @@ from creator_studio_doc_format.core import (
     Insets,
     KeynoteTheme,
     KeyxDocument,
-    Label,
     LayoutProperties,
     Line,
     LineSpacingKindType,
@@ -49,9 +49,11 @@ from creator_studio_doc_format.core import (
     OverallProperties,
     Paragraph,
     ParagraphProperties,
+    Path as ShapePath,
     Position,
     Presentation,
     Preset,
+    Rect,
     Resource,
     Row,
     Shape,
@@ -71,15 +73,23 @@ from creator_studio_doc_format.core import (
     VisualProperties,
 )
 from creator_studio_doc_format.validation import validate_document
+from pygments import lex
+from pygments.lexers import TextLexer, get_lexer_by_name
+from pygments.token import Comment, Error, Generic, Keyword, Name, Number, Operator, Punctuation, String
+from pygments.util import ClassNotFound
 
+from .mermaid import MERMAID_MODES, MermaidRenderer, image_dimensions, render_mermaid
 from .parser import (
+    CalloutBlock,
     CodeBlock,
     Deck,
     HeadingBlock,
     ImageBlock,
     ListBlock,
+    MermaidBlock,
     ParagraphBlock,
     QuoteBlock,
+    SlideBlock,
     SlideSpec,
     TableBlock,
     TextSpan,
@@ -104,7 +114,19 @@ _RGBA_TBL_GRID = RGBA(red=0.82, green=0.84, blue=0.89)
 _NO_BORDER = Stroke(empty=True)
 
 
-@dataclass
+@dataclass(frozen=True)
+class _CalloutStyle:
+    label: str
+    accent: RGBA
+    bg: RGBA
+    border: RGBA
+
+
+def _rgba_hex(hex_color: str) -> RGBA:
+    return _parse_hex_color(hex_color)
+
+
+@dataclass(frozen=True)
 class CompileResult:
     output_path: Path
     slide_count: int
@@ -133,6 +155,177 @@ def _parse_hex_color(value: str) -> RGBA:
     g = int(hex_str[2:4], 16) / 255.0
     b = int(hex_str[4:6], 16) / 255.0
     return RGBA(red=r, green=g, blue=b)
+
+
+_CALLOUT_STYLES: dict[str, _CalloutStyle] = {
+    "NOTE": _CalloutStyle(
+        label="Note",
+        accent=_rgba_hex("#0969DA"),
+        bg=_rgba_hex("#EEF5FF"),
+        border=_rgba_hex("#B6D4FE"),
+    ),
+    "TIP": _CalloutStyle(
+        label="Tip",
+        accent=_rgba_hex("#1A7F37"),
+        bg=_rgba_hex("#ECFDF3"),
+        border=_rgba_hex("#A7E8BF"),
+    ),
+    "IMPORTANT": _CalloutStyle(
+        label="Important",
+        accent=_rgba_hex("#8250DF"),
+        bg=_rgba_hex("#F4EFFF"),
+        border=_rgba_hex("#D2BDFB"),
+    ),
+    "WARNING": _CalloutStyle(
+        label="Warning",
+        accent=_rgba_hex("#9A5B00"),
+        bg=_rgba_hex("#FFF8E6"),
+        border=_rgba_hex("#FCDCA0"),
+    ),
+    "CAUTION": _CalloutStyle(
+        label="Caution",
+        accent=_rgba_hex("#CF222E"),
+        bg=_rgba_hex("#FEF0F0"),
+        border=_rgba_hex("#F8BABA"),
+    ),
+}
+
+_PYGMENTS_PALETTE: tuple[tuple[Any, tuple[RGBA, bool, bool]], ...] = (
+    (Comment, (RGBA(red=0.52, green=0.58, blue=0.68), False, True)),
+    (String, (RGBA(red=0.62, green=0.87, blue=0.49), False, False)),
+    (Number, (RGBA(red=0.98, green=0.63, blue=0.42), False, False)),
+    (Keyword.Constant, (RGBA(red=0.98, green=0.63, blue=0.42), False, False)),
+    (Keyword.Type, (RGBA(red=0.45, green=0.85, blue=0.94), False, False)),
+    (Keyword, (RGBA(red=0.78, green=0.57, blue=0.98), True, False)),
+    (Operator.Word, (RGBA(red=0.78, green=0.57, blue=0.98), True, False)),
+    (Operator, (RGBA(red=0.55, green=0.82, blue=0.96), False, False)),
+    (Punctuation, (RGBA(red=0.74, green=0.79, blue=0.87), False, False)),
+    (Name.Function, (RGBA(red=0.48, green=0.69, blue=1.00), False, False)),
+    (Name.Class, (RGBA(red=0.96, green=0.78, blue=0.45), False, False)),
+    (Name.Namespace, (RGBA(red=0.96, green=0.78, blue=0.45), False, False)),
+    (Name.Exception, (RGBA(red=0.96, green=0.78, blue=0.45), False, False)),
+    (Name.Builtin, (RGBA(red=0.45, green=0.85, blue=0.94), False, False)),
+    (Name.Decorator, (RGBA(red=0.45, green=0.85, blue=0.94), False, False)),
+    (Name.Tag, (RGBA(red=0.95, green=0.48, blue=0.56), False, False)),
+    (Name.Attribute, (RGBA(red=0.96, green=0.78, blue=0.45), False, False)),
+    (Generic.Inserted, (RGBA(red=0.52, green=0.89, blue=0.56), False, False)),
+    (Generic.Deleted, (RGBA(red=0.98, green=0.48, blue=0.52), False, False)),
+    (Generic.Heading, (RGBA(red=0.48, green=0.69, blue=1.00), True, False)),
+    (Generic.Subheading, (RGBA(red=0.48, green=0.69, blue=1.00), True, False)),
+    (Error, (RGBA(red=0.98, green=0.48, blue=0.52), False, False)),
+)
+
+
+def _rounded_rect_path(width: float, height: float, radius: float) -> ShapePath | None:
+    """Build a closed SVG BezierPath for a rounded rectangle in local shape coordinates."""
+    w = round(width, 2)
+    h = round(height, 2)
+    r = round(min(radius, w / 2.0, h / 2.0), 2)
+    if r <= 0 or w <= 0 or h <= 0:
+        return None
+    k = 0.5522847498 * r
+    c = round(r - k, 2)
+    d = (
+        f"M {r} 0 "
+        f"L {round(w - r, 2)} 0 "
+        f"C {round(w - c, 2)} 0 {w} {c} {w} {r} "
+        f"L {w} {round(h - r, 2)} "
+        f"C {w} {round(h - c, 2)} {round(w - c, 2)} {h} {round(w - r, 2)} {h} "
+        f"L {r} {h} "
+        f"C {c} {h} 0 {round(h - c, 2)} 0 {round(h - r, 2)} "
+        f"L 0 {r} "
+        f"C 0 {c} {c} 0 {r} 0 Z"
+    )
+    return ShapePath(
+        bezier=BezierPath(
+            path=d,
+            space=Rect(position=Position(x=0, y=0), size=Size(width=w, height=h)),
+        )
+    )
+
+
+def _token_style(ttype: Any) -> tuple[RGBA, bool, bool]:
+    for token_group, style in _PYGMENTS_PALETTE:
+        if ttype in token_group:
+            return style
+    return (_RGBA_CODE_TEXT, False, False)
+
+
+def _code_to_paragraphs(code: str, lang: str, font_size: float) -> list[Paragraph]:
+    """Lex code with Pygments and return one Paragraph of merged TextRuns per line."""
+    try:
+        lexer = get_lexer_by_name(lang, stripnl=False) if lang else TextLexer(stripnl=False)
+    except ClassNotFound:
+        lexer = TextLexer(stripnl=False)
+
+    lines: list[list[tuple[str, RGBA, bool, bool]]] = [[]]
+    for ttype, value in lex(code, lexer):
+        if not value:
+            continue
+        color, bold, italic = _token_style(ttype)
+        parts = value.split("\n")
+        for idx, part in enumerate(parts):
+            if idx > 0:
+                lines.append([])
+            if not part:
+                continue
+            cur_line = lines[-1]
+            if cur_line and cur_line[-1][1:] == (color, bold, italic):
+                prev_text, _, _, _ = cur_line[-1]
+                cur_line[-1] = (prev_text + part, color, bold, italic)
+            else:
+                cur_line.append((part, color, bold, italic))
+
+    # Pygments lexers often append a single trailing newline token; drop the empty phantom line
+    # if the original code did not end with a newline.
+    if len(lines) > 1 and not lines[-1] and not code.endswith("\n"):
+        lines.pop()
+
+    paragraphs: list[Paragraph] = []
+    for line_runs in lines:
+        if not line_runs:
+            contents = [
+                Constituent(
+                    run=TextRun(
+                        string="",
+                        style=CharacterProperties(
+                            font_name="Menlo-Regular",
+                            font_size=font_size,
+                            character_fill=Fill(color=Color(rgba=_RGBA_CODE_TEXT)),
+                        ),
+                    )
+                )
+            ]
+        else:
+            contents = []
+            for text, color, bold, italic in line_runs:
+                char_kwargs: dict[str, Any] = {
+                    "font_name": "Menlo-Regular",
+                    "font_size": font_size,
+                    "character_fill": Fill(color=Color(rgba=color)),
+                }
+                if bold:
+                    char_kwargs["bold"] = True
+                if italic:
+                    char_kwargs["italic"] = True
+                contents.append(
+                    Constituent(
+                        run=TextRun(
+                            string=text,
+                            style=CharacterProperties(**char_kwargs),
+                        )
+                    )
+                )
+        paragraphs.append(
+            Paragraph(
+                style=ParagraphProperties(
+                    alignment=AlignmentType.LEFT,
+                    line_spacing=LineSpacingType(value=1.25, kind=LineSpacingKindType.RELATIVE),
+                ),
+                contents=contents,
+            )
+        )
+    return paragraphs
 
 
 def _default_presets() -> list[Preset]:
@@ -324,8 +517,121 @@ def _make_textbox(
     )
 
 
+def _fit_image_box(
+    natural_dims: tuple[float, float] | None,
+    *,
+    x: float,
+    y: float,
+    max_width: float,
+    max_height: float,
+) -> tuple[float, float, float, float]:
+    """Fit natural image dimensions within (max_width, max_height) and center horizontally."""
+    if natural_dims and natural_dims[0] > 0 and natural_dims[1] > 0:
+        nat_w, nat_h = natural_dims
+    else:
+        nat_w, nat_h = 16.0, 9.0
+
+    fit_scale = min(max_width / nat_w, max_height / nat_h)
+    img_w = max(1.0, nat_w * fit_scale)
+    img_h = max(1.0, nat_h * fit_scale)
+    img_x = x + max(0.0, (max_width - img_w) / 2.0)
+    return img_x, y, img_w, img_h
+
+
+def _render_image_object(
+    data: bytes,
+    *,
+    preferred_name: str,
+    ext: str,
+    description: str | None,
+    x: float,
+    y: float,
+    width: float,
+    max_bottom: float,
+    scale: float,
+    is_last_block: bool,
+    resources: MutableMapping[str, bytes],
+) -> tuple[SlideObject, float]:
+    """Bundle image bytes into resources and return a centered aspect-preserving Image."""
+    filename = _unique_resource_name(resources, preferred_name)
+    resources[filename] = data
+    avail_h = max(200 * scale, max_bottom - y)
+    max_img_h = avail_h if is_last_block else min(460 * scale, avail_h)
+    dims = image_dimensions(data, ext=ext)
+    img_x, img_y, img_w, img_h = _fit_image_box(
+        dims,
+        x=x,
+        y=y,
+        max_width=width,
+        max_height=max_img_h,
+    )
+    obj = SlideObject(
+        object=CanvasObject(
+            image=Image(
+                description=description,
+                aspect_ratio_locked=True,
+                stroke=_NO_BORDER,
+                geometry=Geometry(
+                    position=Position(x=round(img_x, 1), y=round(img_y, 1)),
+                    size=Size(width=round(img_w, 1), height=round(img_h, 1)),
+                ),
+                resource=Resource(
+                    indirect=IndirectResource(filename=filename)
+                ),
+            )
+        )
+    )
+    return obj, img_h + 24 * scale
+
+
+def _render_code_card(
+    code: str,
+    lang: str,
+    *,
+    x: float,
+    y: float,
+    width: float,
+    max_bottom: float,
+    scale: float,
+) -> tuple[list[SlideObject], float]:
+    font_size = round(24 * scale, 1)
+    code_lines = code.splitlines() or [""]
+    inner_w = max(120 * scale, width - 52 * scale)
+    wrapped_lines = sum(_estimate_lines(line or " ", inner_w, font_size) for line in code_lines)
+    height = min(
+        max(100 * scale, wrapped_lines * font_size * 1.42 + 44 * scale),
+        max(140 * scale, max_bottom - y),
+    )
+    code_paragraphs = _code_to_paragraphs(code, lang, font_size)
+    card = SlideObject(
+        object=CanvasObject(
+            shape=Shape(
+                preset_identifier="m2k_shape_code",
+                path=_rounded_rect_path(width, height, 10 * scale),
+                stroke=_NO_BORDER,
+                geometry=Geometry(
+                    position=Position(x=round(x, 1), y=round(y, 1)),
+                    size=Size(width=round(width, 1), height=round(height, 1)),
+                ),
+                layout_properties=LayoutProperties(
+                    padding=Insets(
+                        top=round(22 * scale, 1),
+                        bottom=round(22 * scale, 1),
+                        left=round(26 * scale, 1),
+                        right=round(26 * scale, 1),
+                    ),
+                    vertical_alignment=VerticalAlignmentType.TOP,
+                    shrink_to_fit=True,
+                ),
+                text=Text(paragraphs=code_paragraphs),
+            )
+        )
+    )
+    return [card], height + 24 * scale
+
+
 def _render_block(
-    block: Any,
+    block: SlideBlock,
     *,
     x: float,
     y: float,
@@ -336,8 +642,12 @@ def _render_block(
     muted_color: RGBA,
     slide_ids: set[str],
     warnings: list[str],
-    resources: Any,
+    resources: MutableMapping[str, bytes],
     base_dir: Path,
+    mermaid_mode: str = "auto",
+    mermaid_renderer: MermaidRenderer | None = None,
+    mermaid_counter: list[int] | None = None,
+    is_last_block: bool = True,
 ) -> tuple[list[SlideObject], float]:
     """Render one SlideBlock into SlideObject(s) and return the vertical height consumed."""
     objects: list[SlideObject] = []
@@ -469,57 +779,152 @@ def _render_block(
         objects.extend([card, bar])
         return objects, height + 22 * scale
 
-    if isinstance(block, CodeBlock):
-        font_size = round(24 * scale, 1)
-        code_lines = block.code.splitlines() or [""]
-        height = min(
-            max(100 * scale, len(code_lines) * font_size * 1.42 + 44 * scale),
-            max(140 * scale, max_bottom - y),
+    if isinstance(block, CalloutBlock):
+        style = _CALLOUT_STYLES.get(block.kind.upper(), _CALLOUT_STYLES["NOTE"])
+        header_text = block.title or style.label
+        header_size = round(28 * scale, 1)
+        body_size = round(28 * scale, 1)
+        inner_w = max(140 * scale, width - 64 * scale)
+        header_lines = _estimate_lines(header_text, inner_w, header_size)
+        body_lines = sum(
+            _estimate_lines(_spans_plain_text(p), inner_w, body_size)
+            for p in block.paragraphs
         )
-        code_para = Paragraph(
-            style=ParagraphProperties(
-                alignment=AlignmentType.LEFT,
-                line_spacing=LineSpacingType(value=1.25, kind=LineSpacingKindType.RELATIVE),
-            ),
-            contents=[
-                Constituent(
-                    run=TextRun(
-                        string=block.code,
-                        style=CharacterProperties(
-                            font_name="Menlo-Regular",
-                            font_size=font_size,
-                            character_fill=Fill(color=Color(rgba=_RGBA_CODE_TEXT)),
-                        ),
-                    )
-                )
-            ],
+        extra_gap = len(block.paragraphs) * 8 * scale
+        raw_h = (
+            header_lines * header_size * 1.3
+            + body_lines * body_size * 1.35
+            + extra_gap
+            + 40 * scale
         )
-        objects.append(
-            SlideObject(
-                object=CanvasObject(
-                    shape=Shape(
-                        preset_identifier="m2k_shape_code",
-                        stroke=_NO_BORDER,
-                        geometry=Geometry(
-                            position=Position(x=round(x, 1), y=round(y, 1)),
-                            size=Size(width=round(width, 1), height=round(height, 1)),
-                        ),
-                        layout_properties=LayoutProperties(
-                            padding=Insets(
-                                top=round(22 * scale, 1),
-                                bottom=round(22 * scale, 1),
-                                left=round(26 * scale, 1),
-                                right=round(26 * scale, 1),
+        height = min(max(92 * scale, raw_h), max(120 * scale, max_bottom - y))
+
+        paras: list[Paragraph] = [
+            Paragraph(
+                style=ParagraphProperties(
+                    space_after=round(8 * scale, 1) if block.paragraphs else 0.0,
+                ),
+                contents=[
+                    Constituent(
+                        run=TextRun(
+                            string=header_text,
+                            style=CharacterProperties(
+                                font_name="Helvetica Neue",
+                                font_size=header_size,
+                                bold=True,
+                                character_fill=Fill(color=Color(rgba=style.accent)),
                             ),
-                            vertical_alignment=VerticalAlignmentType.TOP,
-                            shrink_to_fit=True,
-                        ),
-                        text=Text(paragraphs=[code_para]),
+                        )
                     )
+                ],
+            )
+        ]
+        for idx, p in enumerate(block.paragraphs):
+            paras.append(
+                Paragraph(
+                    style=ParagraphProperties(
+                        space_after=round(8 * scale, 1) if idx < len(block.paragraphs) - 1 else 0.0,
+                    ),
+                    contents=_spans_to_constituents(
+                        p,
+                        base_size=body_size,
+                        base_color=_RGBA_INK,
+                        slide_ids=slide_ids,
+                        warnings=warnings,
+                    ),
+                )
+            )
+
+        card = SlideObject(
+            object=CanvasObject(
+                shape=Shape(
+                    path=_rounded_rect_path(width, height, 12 * scale),
+                    fill=Fill(color=Color(rgba=style.bg)),
+                    stroke=Stroke(line=Line(color=Color(rgba=style.border), width=1.0)),
+                    geometry=Geometry(
+                        position=Position(x=round(x, 1), y=round(y, 1)),
+                        size=Size(width=round(width, 1), height=round(height, 1)),
+                    ),
+                    layout_properties=LayoutProperties(
+                        padding=Insets(
+                            top=round(18 * scale, 1),
+                            bottom=round(18 * scale, 1),
+                            left=round(36 * scale, 1),
+                            right=round(24 * scale, 1),
+                        ),
+                        vertical_alignment=VerticalAlignmentType.TOP,
+                        shrink_to_fit=True,
+                    ),
+                    text=Text(paragraphs=paras),
                 )
             )
         )
-        return objects, height + 24 * scale
+        bar_w = round(6 * scale, 1)
+        bar_h = round(max(24 * scale, height - 32 * scale), 1)
+        bar = SlideObject(
+            object=CanvasObject(
+                shape=Shape(
+                    path=_rounded_rect_path(bar_w, bar_h, bar_w / 2.0),
+                    fill=Fill(color=Color(rgba=style.accent)),
+                    stroke=_NO_BORDER,
+                    geometry=Geometry(
+                        position=Position(x=round(x + 14 * scale, 1), y=round(y + 16 * scale, 1)),
+                        size=Size(width=bar_w, height=bar_h),
+                    ),
+                )
+            )
+        )
+        objects.extend([card, bar])
+        return objects, height + 22 * scale
+
+    if isinstance(block, CodeBlock):
+        return _render_code_card(
+            block.code,
+            block.lang,
+            x=x,
+            y=y,
+            width=width,
+            max_bottom=max_bottom,
+            scale=scale,
+        )
+
+    if isinstance(block, MermaidBlock):
+        rendered = render_mermaid(
+            block.code,
+            mode=mermaid_mode,
+            renderer=mermaid_renderer,
+            warnings=warnings,
+        )
+        if rendered is None:
+            return _render_code_card(
+                block.code,
+                "mermaid",
+                x=x,
+                y=y,
+                width=width,
+                max_bottom=max_bottom,
+                scale=scale,
+            )
+        img_bytes, ext = rendered
+        if mermaid_counter is not None:
+            mermaid_counter[0] += 1
+            num = mermaid_counter[0]
+        else:
+            num = 1
+        img_obj, consumed_h = _render_image_object(
+            img_bytes,
+            preferred_name=f"mermaid-{num}{ext}",
+            ext=ext,
+            description="Mermaid diagram",
+            x=x,
+            y=y,
+            width=width,
+            max_bottom=max_bottom,
+            scale=scale,
+            is_last_block=is_last_block,
+            resources=resources,
+        )
+        return [img_obj], consumed_h
 
     if isinstance(block, TableBlock):
         num_cols = max(
@@ -669,32 +1074,76 @@ def _render_block(
             objects.append(_make_textbox(x=x, y=y, width=width, height=h, paragraphs=[fallback]))
             return objects, h + 16 * scale
 
-        filename = _unique_resource_name(resources, img_path.name)
-        resources[filename] = img_path.read_bytes()
-        avail_h = max(240 * scale, max_bottom - y)
-        img_h = min(460 * scale, avail_h)
-        img_w = min(width, img_h * 16.0 / 9.0)
-        objects.append(
-            SlideObject(
-                object=CanvasObject(
-                    image=Image(
-                        description=block.alt or None,
-                        aspect_ratio_locked=True,
-                        stroke=_NO_BORDER,
-                        geometry=Geometry(
-                            position=Position(x=round(x, 1), y=round(y, 1)),
-                            size=Size(width=round(img_w, 1), height=round(img_h, 1)),
-                        ),
-                        resource=Resource(
-                            indirect=IndirectResource(filename=filename)
-                        ),
-                    )
-                )
-            )
+        img_bytes = img_path.read_bytes()
+        img_obj, consumed_h = _render_image_object(
+            img_bytes,
+            preferred_name=img_path.name,
+            ext=img_path.suffix,
+            description=block.alt or None,
+            x=x,
+            y=y,
+            width=width,
+            max_bottom=max_bottom,
+            scale=scale,
+            is_last_block=is_last_block,
+            resources=resources,
         )
-        return objects, img_h + 24 * scale
+        return [img_obj], consumed_h
 
     return objects, 0.0
+
+
+def _render_block_sequence(
+    blocks: list[SlideBlock],
+    *,
+    slide_index: int,
+    x: float,
+    y_start: float,
+    width: float,
+    max_bottom: float,
+    scale: float,
+    text_color: RGBA,
+    muted_color: RGBA,
+    slide_ids: set[str],
+    warnings: list[str],
+    resources: MutableMapping[str, bytes],
+    base_dir: Path,
+    mermaid_mode: str,
+    mermaid_renderer: MermaidRenderer | None,
+    mermaid_counter: list[int],
+    region_label: str = "content",
+) -> tuple[list[SlideObject], float]:
+    """Lay out a vertical sequence of blocks within a bounded box."""
+    objects: list[SlideObject] = []
+    y_cursor = y_start
+    total = len(blocks)
+    for idx, block in enumerate(blocks):
+        if y_cursor >= max_bottom - 40 * scale:
+            warnings.append(
+                f"Slide {slide_index} {region_label} exceeded vertical canvas budget; remaining blocks may overlap."
+            )
+            y_cursor = max_bottom - 120 * scale
+        objs, consumed_h = _render_block(
+            block,
+            x=x,
+            y=y_cursor,
+            width=width,
+            max_bottom=max_bottom,
+            scale=scale,
+            text_color=text_color,
+            muted_color=muted_color,
+            slide_ids=slide_ids,
+            warnings=warnings,
+            resources=resources,
+            base_dir=base_dir,
+            mermaid_mode=mermaid_mode,
+            mermaid_renderer=mermaid_renderer,
+            mermaid_counter=mermaid_counter,
+            is_last_block=(idx == total - 1),
+        )
+        objects.extend(objs)
+        y_cursor += consumed_h
+    return objects, y_cursor
 
 
 def _compile_standard_slide(
@@ -703,19 +1152,28 @@ def _compile_standard_slide(
     deck: Deck,
     slide_ids: set[str],
     warnings: list[str],
-    resources: Any,
+    resources: MutableMapping[str, bytes],
     base_dir: Path,
+    mermaid_mode: str = "auto",
+    mermaid_renderer: MermaidRenderer | None = None,
+    mermaid_counter: list[int] | None = None,
+    canvas_size: tuple[float, float] | None = None,
 ) -> Slide:
-    width = float(deck.config.width)
-    height = float(deck.config.height)
+    if canvas_size is not None:
+        width, height = float(canvas_size[0]), float(canvas_size[1])
+    else:
+        width = float(deck.config.width)
+        height = float(deck.config.height)
     scale = min(width / 1920.0, height / 1080.0)
     margin_x = 120.0 * scale
     content_w = width - 2 * margin_x
     max_bottom = height - (90.0 * scale if deck.config.footer else 64.0 * scale)
+    counter = mermaid_counter if mermaid_counter is not None else [0]
 
     is_cover = (
         spec.index == 1
         and not spec.section
+        and spec.columns is None
         and len(spec.blocks) <= 3
         and all(isinstance(b, (HeadingBlock, ParagraphBlock)) for b in spec.blocks)
     )
@@ -848,6 +1306,10 @@ def _compile_standard_slide(
                 warnings=warnings,
                 resources=resources,
                 base_dir=base_dir,
+                mermaid_mode=mermaid_mode,
+                mermaid_renderer=mermaid_renderer,
+                mermaid_counter=counter,
+                is_last_block=(not blocks and spec.columns is None),
             )
             slide_objects.extend(hdr_objs)
             y_cursor += hdr_h
@@ -867,16 +1329,12 @@ def _compile_standard_slide(
             )
             y_cursor += 22 * scale
 
-        for block in blocks:
-            if y_cursor >= max_bottom - 40 * scale:
-                warnings.append(
-                    f"Slide {spec.index} content exceeded vertical canvas budget; remaining blocks may overlap."
-                )
-                y_cursor = max_bottom - 120 * scale
-            objs, consumed_h = _render_block(
-                block,
+        if blocks:
+            top_objs, y_cursor = _render_block_sequence(
+                blocks,
+                slide_index=spec.index,
                 x=margin_x,
-                y=y_cursor,
+                y_start=y_cursor,
                 width=content_w,
                 max_bottom=max_bottom,
                 scale=scale,
@@ -886,9 +1344,61 @@ def _compile_standard_slide(
                 warnings=warnings,
                 resources=resources,
                 base_dir=base_dir,
+                mermaid_mode=mermaid_mode,
+                mermaid_renderer=mermaid_renderer,
+                mermaid_counter=counter,
             )
-            slide_objects.extend(objs)
-            y_cursor += consumed_h
+            slide_objects.extend(top_objs)
+
+        if spec.columns is not None:
+            left_blocks, right_blocks = spec.columns
+            gutter = 56.0 * scale
+            usable_w = content_w - gutter
+            left_w = round(usable_w * spec.column_ratio, 1)
+            right_w = round(usable_w - left_w, 1)
+            left_x = round(margin_x, 1)
+            right_x = round(margin_x + left_w + gutter, 1)
+
+            left_objs, _ = _render_block_sequence(
+                left_blocks,
+                slide_index=spec.index,
+                x=left_x,
+                y_start=y_cursor,
+                width=left_w,
+                max_bottom=max_bottom,
+                scale=scale,
+                text_color=text_color,
+                muted_color=muted_color,
+                slide_ids=slide_ids,
+                warnings=warnings,
+                resources=resources,
+                base_dir=base_dir,
+                mermaid_mode=mermaid_mode,
+                mermaid_renderer=mermaid_renderer,
+                mermaid_counter=counter,
+                region_label="left column",
+            )
+            right_objs, _ = _render_block_sequence(
+                right_blocks,
+                slide_index=spec.index,
+                x=right_x,
+                y_start=y_cursor,
+                width=right_w,
+                max_bottom=max_bottom,
+                scale=scale,
+                text_color=text_color,
+                muted_color=muted_color,
+                slide_ids=slide_ids,
+                warnings=warnings,
+                resources=resources,
+                base_dir=base_dir,
+                mermaid_mode=mermaid_mode,
+                mermaid_renderer=mermaid_renderer,
+                mermaid_counter=counter,
+                region_label="right column",
+            )
+            slide_objects.extend(left_objs)
+            slide_objects.extend(right_objs)
 
     if deck.config.footer and not spec.section:
         footer_para = Paragraph(
@@ -936,8 +1446,26 @@ def _compile_template_slide(
     slide_ids: set[str],
     warnings: list[str],
     base_dir: Path,
+    mermaid_mode: str = "auto",
+    mermaid_renderer: MermaidRenderer | None = None,
+    mermaid_counter: list[int] | None = None,
 ) -> Slide:
     """Create a slide from a template .keyx theme layout when available."""
+    size = doc.presentation.slide_size or Size(width=deck.config.width, height=deck.config.height)
+    if spec.columns is not None:
+        return _compile_standard_slide(
+            spec,
+            deck=deck,
+            slide_ids=slide_ids,
+            warnings=warnings,
+            resources=doc.resources,
+            base_dir=base_dir,
+            mermaid_mode=mermaid_mode,
+            mermaid_renderer=mermaid_renderer,
+            mermaid_counter=mermaid_counter,
+            canvas_size=(size.width, size.height),
+        )
+
     theme = doc.presentation.theme
     layouts = summarize_slide_layouts(theme) if theme and theme.slide_layouts else {}
     layout_lookup = {name.lower(): name for name in layouts}
@@ -968,6 +1496,10 @@ def _compile_template_slide(
             warnings=warnings,
             resources=doc.resources,
             base_dir=base_dir,
+            mermaid_mode=mermaid_mode,
+            mermaid_renderer=mermaid_renderer,
+            mermaid_counter=mermaid_counter,
+            canvas_size=(size.width, size.height),
         )
 
     slide = slide_from_layout(theme, chosen_layout)
@@ -1018,26 +1550,27 @@ def _compile_template_slide(
         slide.contents = []
 
     if remaining_blocks:
-        size = doc.presentation.slide_size or Size(width=1920, height=1080)
         scale = min(size.width / 1920.0, size.height / 1080.0)
-        y_cursor = 260.0 * scale
-        for block in remaining_blocks:
-            objs, consumed_h = _render_block(
-                block,
-                x=120.0 * scale,
-                y=y_cursor,
-                width=size.width - 240.0 * scale,
-                max_bottom=size.height - 80.0 * scale,
-                scale=scale,
-                text_color=_RGBA_INK,
-                muted_color=_RGBA_MUTED,
-                slide_ids=slide_ids,
-                warnings=warnings,
-                resources=doc.resources,
-                base_dir=base_dir,
-            )
-            slide.contents.extend(objs)
-            y_cursor += consumed_h
+        counter = mermaid_counter if mermaid_counter is not None else [0]
+        extra_objs, _ = _render_block_sequence(
+            remaining_blocks,
+            slide_index=spec.index,
+            x=120.0 * scale,
+            y_start=260.0 * scale,
+            width=size.width - 240.0 * scale,
+            max_bottom=size.height - 80.0 * scale,
+            scale=scale,
+            text_color=_RGBA_INK,
+            muted_color=_RGBA_MUTED,
+            slide_ids=slide_ids,
+            warnings=warnings,
+            resources=doc.resources,
+            base_dir=base_dir,
+            mermaid_mode=mermaid_mode,
+            mermaid_renderer=mermaid_renderer,
+            mermaid_counter=counter,
+        )
+        slide.contents.extend(extra_objs)
 
     return slide
 
@@ -1048,10 +1581,18 @@ def compile_deck(
     *,
     base_dir: Path,
     template_override: Path | None = None,
+    mermaid_mode: str | None = None,
+    mermaid_renderer: MermaidRenderer | None = None,
 ) -> CompileResult:
     """Compile a parsed Deck into a validated .keyx file."""
     warnings = list(deck.warnings)
     slide_ids = {s.identifier for s in deck.slides if s.identifier}
+    effective_mermaid = (mermaid_mode or deck.config.mermaid or "auto").strip().lower()
+    if effective_mermaid not in MERMAID_MODES:
+        raise ValueError(
+            f"Unsupported mermaid mode {effective_mermaid!r}; expected one of {sorted(MERMAID_MODES)}."
+        )
+    mermaid_counter = [0]
 
     template_path = template_override
     if template_path is None and deck.config.template:
@@ -1072,6 +1613,9 @@ def compile_deck(
                 slide_ids=slide_ids,
                 warnings=warnings,
                 base_dir=base_dir,
+                mermaid_mode=effective_mermaid,
+                mermaid_renderer=mermaid_renderer,
+                mermaid_counter=mermaid_counter,
             )
             for spec in deck.slides
         ]
@@ -1085,6 +1629,9 @@ def compile_deck(
                 warnings=warnings,
                 resources=resources,
                 base_dir=base_dir,
+                mermaid_mode=effective_mermaid,
+                mermaid_renderer=mermaid_renderer,
+                mermaid_counter=mermaid_counter,
             )
             for spec in deck.slides
         ]

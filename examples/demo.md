@@ -15,11 +15,11 @@ footer: md2keyx • Apple Keynote Interchange Format (.keyx)
 <!-- layout: section -->
 
 # Section 1: Core Features
-## Standard CommonMark + Keynote Navigator Hierarchy
+## Standard CommonMark, Callouts & Syntax Highlighting
 
 ---
 
-# Text, Links, Lists & Quotes
+# Text, Lists & GFM Callouts
 
 This deck compiles **standard Markdown** into schema-validated `.keyx` bundles with *real* Keynote objects, ~~hacks~~, and `inline_code`.
 
@@ -29,15 +29,19 @@ This deck compiles **standard Markdown** into schema-validated `.keyx` bundles w
   - Works in GitHub & Obsidian previews without Setext heading bugs
 - Links like [Apple .keyx Docs](https://developer.apple.com/documentation/keynoteinterchangeformat) use native `HyperlinkField`
 
-> Every presentation passes Apple's `validate_document` hook before saving.
+> [!NOTE] Schema Validated
+> Every presentation passes `validate_document` before saving, with **zero** `null` override leaks.
+
+> [!TIP]
+> Use `> [!TIP]`, `> [!IMPORTANT]`, `> [!WARNING]`, and `> [!CAUTION]` for styled callout cards.
 
 <!-- note: Notice Slide 2 set layout: section, so this slide automatically nested at depth=2 in Keynote's navigator. -->
 
 ---
 
-# Code Blocks & Tables
+# Syntax-Highlighted Code & Tables
 
-Fenced code blocks render inside dark monospace cards (and `---` inside fences never splits slides):
+Fenced code blocks lex with Pygments into colored `TextRun`s on dark monospace cards (and `---` inside fences never splits slides):
 
 ```python
 from pathlib import Path
@@ -50,9 +54,9 @@ compile_deck(deck, Path("out/demo.keyx"), base_dir=Path("examples"))
 
 | Feature | `.keyx` Target | Status |
 | :--- | :--- | :--- |
-| Headings & Lists | `Textbox` + `ListProperties` | MVP |
-| Tables | Native `Table` | MVP |
-| Mermaid Diagrams | SVG / PNG `Image` | Phase 2 |
+| Syntax Highlighting | Pygments -> `TextRun` colors | Supported |
+| GFM Callouts | Rounded `Shape` + accent bar | Supported |
+| Mermaid Diagrams | 2x PNG `Image` in `Data/` | Supported |
 
 ::: notes
 Pandoc-style ::: notes blocks also map cleanly to Slide.note.
@@ -61,19 +65,36 @@ Pandoc-style ::: notes blocks also map cleanly to Slide.note.
 ---
 <!-- layout: section -->
 
-# Section 2: Next Up
-## Phase 2 Value-Adds
+# Section 2: Diagrams & Layouts
+## Two-Column Slides & Embedded Mermaid Diagrams
 
 ---
 <!-- depth: 2 -->
-<!-- identifier: phase-2-roadmap -->
+<!-- identifier: architecture-overview -->
+<!-- columns: 45/55 -->
 
-# Phase 2 Roadmap
+# Compilation Pipeline
 
-1. **Mermaid → Embed**: Test Keynote 16.0 `.svg` vs raster/PDF support inside `Image.resource`
-2. **Syntax Highlighting**: Pygments tokens → colored `TextRun`s
-3. **Two-Column Layouts & Callouts**: `::right::` splits and `> [!NOTE]` cards
+## How Markdown becomes `.keyx`
 
-Jump to [Phase 2 Roadmap](#phase-2-roadmap) or check [creator-studio-doc-format](https://github.com/apple/creator-studio-doc-format).
+- **Parse**: YAML frontmatter, slide breaks, callouts, and column splits
+- **Render**: High-DPI Mermaid PNGs bundled into `Data/`
+- **Compile**: Aspect-preserving `Image` and styled `Shape` geometry
 
-<!-- note: Explicit depth: 2 and identifier: phase-2-roadmap set via HTML comments. -->
+> [!IMPORTANT] CommonMark Compatible
+> `<!-- column -->` and `<!-- columns: 45/55 -->` stay invisible in GitHub Markdown previews.
+
+Jump back to [Compilation Pipeline](#architecture-overview).
+
+<!-- column -->
+
+```mermaid
+flowchart LR
+  MD[Markdown Deck] --> Parser[AST Parser]
+  Parser --> Compiler[Keyx Compiler]
+  Parser --> Mermaid[Mermaid Renderer]
+  Mermaid --> Compiler
+  Compiler --> Keyx[Validated .keyx]
+```
+
+<!-- note: Two-column slide with explicit 45/55 split and embedded Mermaid diagram. -->

@@ -4,10 +4,12 @@ Supports:
 - One standard YAML frontmatter block at the top of the file.
 - `---` slide delimiters (ignoring `---` inside fenced code blocks).
 - Per-slide HTML comment directives (`<!-- depth: 2 -->`, `<!-- layout: section -->`,
-  `<!-- background: #111827 -->`, `<!-- section: true -->`).
+  `<!-- background: #111827 -->`, `<!-- section: true -->`, `<!-- column -->`,
+  `<!-- columns: 60/40 -->`).
 - Presenter notes via `<!-- note: ... -->` or Pandoc-style `::: notes ... :::`.
 - Headings, paragraphs, inline styles (bold, italic, strikethrough, code, links),
-  nested bullet/ordered lists, fenced code blocks, blockquotes, GFM tables, and images.
+  nested bullet/ordered lists, fenced code blocks, Mermaid diagrams, blockquotes,
+  GitHub-flavored callouts, GFM tables, and images.
 """
 
 from __future__ import annotations
@@ -24,6 +26,14 @@ from markdown_it.token import Token
 _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 _SLIDE_SPLIT_RE = re.compile(r"^\s*---\s*$")
 _DIRECTIVE_KEYS = frozenset({"depth", "layout", "section", "background", "identifier"})
+_COLUMN_DIRECTIVE_RE = re.compile(r"^(columns|column|col)(?:\s*:\s*(.*))?$", re.IGNORECASE)
+_COLUMN_RATIO_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)$")
+
+CALLOUT_KINDS = ("NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION")
+_CALLOUT_MARKER_RE = re.compile(
+    r"^\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\](?:$|\s+(.*)$)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -69,7 +79,19 @@ class CodeBlock:
 
 
 @dataclass(frozen=True)
+class MermaidBlock:
+    code: str
+
+
+@dataclass(frozen=True)
 class QuoteBlock:
+    paragraphs: list[list[TextSpan]]
+
+
+@dataclass(frozen=True)
+class CalloutBlock:
+    kind: str  # NOTE | TIP | IMPORTANT | WARNING | CAUTION
+    title: str | None
     paragraphs: list[list[TextSpan]]
 
 
@@ -91,7 +113,9 @@ SlideBlock = (
     | ParagraphBlock
     | ListBlock
     | CodeBlock
+    | MermaidBlock
     | QuoteBlock
+    | CalloutBlock
     | TableBlock
     | ImageBlock
 )
@@ -109,6 +133,8 @@ class SlideSpec:
     identifier: str | None = None
     note: str | None = None
     blocks: list[SlideBlock] = field(default_factory=list)
+    columns: tuple[list[SlideBlock], list[SlideBlock]] | None = None
+    column_ratio: float = 0.5
 
 
 @dataclass
@@ -123,6 +149,7 @@ class DeckConfig:
     hierarchy: str = "section"  # "section" or "flat"
     author: str | None = None
     footer: str | None = None
+    mermaid: str = "auto"  # "auto" | "mmdc" | "ink" | "off"
 
 
 @dataclass
@@ -176,14 +203,61 @@ def _split_slides_respecting_fences(markdown_body: str) -> list[str]:
     return ["\n".join(chunk).strip() for chunk in chunks if "\n".join(chunk).strip()]
 
 
+def _parse_column_directive(
+    inner_stripped: str,
+) -> tuple[str, float | None, str | None] | None:
+    """Parse column/columns HTML comment directive, returning (kind, ratio, warning)."""
+    match = _COLUMN_DIRECTIVE_RE.match(inner_stripped)
+    if not match:
+        return None
+    kind = match.group(1).lower()
+    raw_ratio = (match.group(2) or "").strip()
+    if not raw_ratio:
+        return kind, None, None
+
+    ratio_match = _COLUMN_RATIO_RE.match(raw_ratio)
+    if not ratio_match:
+        raise ValueError(
+            f"Invalid column ratio directive {inner_stripped!r}; expected e.g. '60/40'."
+        )
+    left_val = float(ratio_match.group(1))
+    right_val = float(ratio_match.group(2))
+    if left_val <= 0 or right_val <= 0:
+        raise ValueError(
+            f"Invalid column ratio {raw_ratio!r}; both column proportions must be positive."
+        )
+    ratio = left_val / (left_val + right_val)
+    clamped = max(0.20, min(0.80, ratio))
+    warning: str | None = None
+    if abs(clamped - ratio) > 1e-9:
+        left_pct = int(round(clamped * 100))
+        warning = (
+            f"Column ratio {raw_ratio} clamped to {left_pct}/{100 - left_pct} "
+            "(valid range 20..80)."
+        )
+    return kind, clamped, warning
+
+
 def _extract_notes_and_directives(
     slide_md: str,
-) -> tuple[str, dict[str, Any], list[str]]:
-    """Strip presenter notes and HTML comment directives outside fenced code blocks."""
+) -> tuple[
+    str,
+    dict[str, Any],
+    list[str],
+    tuple[str | None, str, str] | None,
+    float,
+    list[str],
+]:
+    """Strip presenter notes, HTML comment directives, and column splits outside fences."""
     lines = slide_md.splitlines()
     kept: list[str] = []
     notes: list[str] = []
     directives: dict[str, Any] = {}
+    col_warnings: list[str] = []
+
+    pre_columns_md: str | None = None
+    left_md: str | None = None
+    column_ratio = 0.5
 
     fence_char: str | None = None
     fence_len = 0
@@ -234,7 +308,26 @@ def _extract_notes_and_directives(
                 inner = inner[:-3]
             inner_stripped = inner.strip()
 
-            if inner_stripped.lower().startswith("note:"):
+            col_parsed = _parse_column_directive(inner_stripped)
+            if col_parsed is not None:
+                col_kind, col_ratio, col_warn = col_parsed
+                if col_warn:
+                    col_warnings.append(col_warn)
+                if col_ratio is not None:
+                    column_ratio = col_ratio
+                if col_kind == "columns":
+                    if left_md is None and any(ln.strip() for ln in kept):
+                        pre_columns_md = "\n".join(kept).strip()
+                        kept = []
+                else:
+                    if left_md is None:
+                        left_md = "\n".join(kept).strip()
+                        kept = []
+                    else:
+                        col_warnings.append(
+                            "Multiple column breaks on one slide; keeping two-column layout."
+                        )
+            elif inner_stripped.lower().startswith("note:"):
                 note_text = inner_stripped[5:].strip()
                 if note_text:
                     notes.append(note_text)
@@ -265,18 +358,30 @@ def _extract_notes_and_directives(
         kept.append(line)
         i += 1
 
-    return "\n".join(kept).strip(), directives, notes
+    tail_md = "\n".join(kept).strip()
+    if left_md is not None:
+        return (
+            tail_md,
+            directives,
+            notes,
+            (pre_columns_md, left_md, tail_md),
+            column_ratio,
+            col_warnings,
+        )
+
+    combined = "\n\n".join(part for part in (pre_columns_md, tail_md) if part)
+    return combined, directives, notes, None, column_ratio, col_warnings
 
 
-def _parse_inline_spans(inline_token: Token) -> list[TextSpan]:
-    """Convert a markdown-it inline token tree into flat TextSpan runs."""
+def _parse_inline_children(children: list[Token]) -> list[TextSpan]:
+    """Convert a sequence of markdown-it inline child tokens into flat TextSpan runs."""
     spans: list[TextSpan] = []
     bold = False
     italic = False
     strike = False
     link_url: str | None = None
 
-    for child in inline_token.children or []:
+    for child in children:
         t = child.type
         if t == "strong_open":
             bold = True
@@ -338,6 +443,53 @@ def _parse_inline_spans(inline_token: Token) -> list[TextSpan]:
     return spans
 
 
+def _parse_inline_spans(inline_token: Token) -> list[TextSpan]:
+    """Convert a markdown-it inline token tree into flat TextSpan runs."""
+    return _parse_inline_children(inline_token.children or [])
+
+
+def _parse_blockquote(inline_tokens: list[Token]) -> QuoteBlock | CalloutBlock | None:
+    """Parse blockquote inline tokens into a GFM CalloutBlock or QuoteBlock."""
+    if not inline_tokens:
+        return None
+
+    first_children = inline_tokens[0].children or []
+    split_idx: int | None = None
+    for idx, child in enumerate(first_children):
+        if child.type in ("softbreak", "hardbreak"):
+            split_idx = idx
+            break
+
+    header_children = first_children if split_idx is None else first_children[:split_idx]
+    body_children = [] if split_idx is None else first_children[split_idx + 1 :]
+
+    if header_children and header_children[0].type == "text":
+        marker_match = _CALLOUT_MARKER_RE.match(header_children[0].content)
+        if marker_match:
+            kind = marker_match.group(1).upper()
+            title_prefix = marker_match.group(2) or ""
+            rest_title_spans = (
+                _parse_inline_children(header_children[1:])
+                if len(header_children) > 1
+                else []
+            )
+            custom_title = (title_prefix + "".join(s.text for s in rest_title_spans)).strip() or None
+
+            paragraphs: list[list[TextSpan]] = []
+            if body_children:
+                first_body_spans = _parse_inline_children(body_children)
+                if first_body_spans:
+                    paragraphs.append(first_body_spans)
+            for tok in inline_tokens[1:]:
+                spans = _parse_inline_spans(tok)
+                if spans:
+                    paragraphs.append(spans)
+            return CalloutBlock(kind=kind, title=custom_title, paragraphs=paragraphs)
+
+    quote_paras = [spans for tok in inline_tokens if (spans := _parse_inline_spans(tok))]
+    return QuoteBlock(paragraphs=quote_paras) if quote_paras else None
+
+
 def _parse_blocks(slide_body: str, md: MarkdownIt) -> list[SlideBlock]:
     """Parse cleaned slide markdown into SlideBlock objects."""
     if not slide_body.strip():
@@ -379,7 +531,11 @@ def _parse_blocks(slide_body: str, md: MarkdownIt) -> list[SlideBlock]:
 
         if tok.type == "fence" or tok.type == "code_block":
             lang = (tok.info or "").strip().split()[0] if tok.info else ""
-            blocks.append(CodeBlock(lang=lang, code=tok.content.rstrip("\n")))
+            code = tok.content.rstrip("\n")
+            if tok.type == "fence" and lang.lower() == "mermaid":
+                blocks.append(MermaidBlock(code=code))
+            else:
+                blocks.append(CodeBlock(lang=lang, code=code))
             i += 1
             continue
 
@@ -412,7 +568,7 @@ def _parse_blocks(slide_body: str, md: MarkdownIt) -> list[SlideBlock]:
             continue
 
         if tok.type == "blockquote_open":
-            quote_paras: list[list[TextSpan]] = []
+            inline_tokens: list[Token] = []
             depth = 1
             j = i + 1
             while j < len(tokens) and depth > 0:
@@ -422,12 +578,11 @@ def _parse_blocks(slide_body: str, md: MarkdownIt) -> list[SlideBlock]:
                 elif cur.type == "blockquote_close":
                     depth -= 1
                 elif cur.type == "inline":
-                    spans = _parse_inline_spans(cur)
-                    if spans:
-                        quote_paras.append(spans)
+                    inline_tokens.append(cur)
                 j += 1
-            if quote_paras:
-                blocks.append(QuoteBlock(paragraphs=quote_paras))
+            parsed_quote = _parse_blockquote(inline_tokens)
+            if parsed_quote is not None:
+                blocks.append(parsed_quote)
             i = j
             continue
 
@@ -475,7 +630,19 @@ def _build_deck_config(raw: dict[str, Any]) -> DeckConfig:
 
     hierarchy = str(raw.get("hierarchy", "section")).lower()
     if hierarchy not in ("section", "flat"):
-        raise ValueError(f"Unsupported hierarchy mode {hierarchy!r}; expected 'section' or 'flat'.")
+        raise ValueError(
+            f"Unsupported hierarchy mode {hierarchy!r}; expected 'section' or 'flat'."
+        )
+
+    raw_mermaid = raw.get("mermaid", "auto")
+    if raw_mermaid is False:
+        mermaid_mode = "off"
+    else:
+        mermaid_mode = str(raw_mermaid).strip().lower()
+    if mermaid_mode not in ("auto", "mmdc", "ink", "off"):
+        raise ValueError(
+            f"Unsupported mermaid mode {mermaid_mode!r}; expected 'auto', 'mmdc', 'ink', or 'off'."
+        )
 
     return DeckConfig(
         theme=str(raw.get("theme", "White")),
@@ -486,6 +653,7 @@ def _build_deck_config(raw: dict[str, Any]) -> DeckConfig:
         hierarchy=hierarchy,
         author=str(raw["author"]) if raw.get("author") else None,
         footer=str(raw["footer"]) if raw.get("footer") else None,
+        mermaid=mermaid_mode,
     )
 
 
@@ -502,7 +670,12 @@ def parse_markdown(source: str) -> Deck:
     prev_depth = 1
 
     for idx, raw_slide in enumerate(raw_slides, start=1):
-        cleaned_md, directives, notes = _extract_notes_and_directives(raw_slide)
+        cleaned_md, directives, notes, col_parts, col_ratio, col_warnings = (
+            _extract_notes_and_directives(raw_slide)
+        )
+        for cw in col_warnings:
+            warnings.append(f"Slide {idx}: {cw}")
+
         layout = str(directives["layout"]) if directives.get("layout") is not None else None
         is_section = bool(directives.get("section", False)) or (
             layout is not None and layout.strip().lower() == "section"
@@ -538,7 +711,22 @@ def parse_markdown(source: str) -> Deck:
             depth = 1
 
         prev_depth = depth
-        blocks = _parse_blocks(cleaned_md, md)
+
+        columns: tuple[list[SlideBlock], list[SlideBlock]] | None = None
+        if col_parts is not None:
+            pre_md, left_md, right_md = col_parts
+            left_blocks = _parse_blocks(left_md, md)
+            right_blocks = _parse_blocks(right_md, md)
+            if pre_md is not None:
+                blocks = _parse_blocks(pre_md, md)
+            elif left_blocks and isinstance(left_blocks[0], HeadingBlock):
+                blocks = [left_blocks.pop(0)]
+            else:
+                blocks = []
+            columns = (left_blocks, right_blocks)
+        else:
+            blocks = _parse_blocks(cleaned_md, md)
+
         slides.append(
             SlideSpec(
                 index=idx,
@@ -549,6 +737,8 @@ def parse_markdown(source: str) -> Deck:
                 identifier=str(directives["identifier"]) if directives.get("identifier") else None,
                 note="\n\n".join(notes) if notes else None,
                 blocks=blocks,
+                columns=columns,
+                column_ratio=col_ratio,
             )
         )
 
