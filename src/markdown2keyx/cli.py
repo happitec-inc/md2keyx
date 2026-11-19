@@ -31,6 +31,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional template .keyx file whose theme layouts and styles are used",
     )
     parser.add_argument(
+        "--mermaid",
+        choices=["auto", "mmdc", "ink", "off"],
+        default=None,
+        help="Mermaid diagram renderer mode (default: frontmatter 'mermaid' or 'auto')",
+    )
+    parser.add_argument(
         "--open",
         action="store_true",
         help="Open the generated .keyx in Keynote Creator Studio",
@@ -46,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         output_path,
         base_dir=args.input.resolve().parent,
         template_override=args.template,
+        mermaid_mode=args.mermaid,
     )
 
     for warning in result.warnings:

@@ -60,6 +60,7 @@ source = { editable = "." }
 dependencies = [
     { name = "creator-studio-doc-format" },
     { name = "markdown-it-py" },
+    { name = "pygments" },
     { name = "pyyaml" },
 ]
 
@@ -72,6 +73,7 @@ dev = [
 requires-dist = [
     { name = "creator-studio-doc-format", specifier = ">=0.1.0" },
     { name = "markdown-it-py", specifier = ">=4.0" },
+    { name = "pygments", specifier = ">=2.18" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 
